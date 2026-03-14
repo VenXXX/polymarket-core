@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: polymarket-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy allkeys-lru
+    networks:
+      - polymarket-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  mysql:
+    image: mysql:8.0
+    container_name: polymarket-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: polymarket
+      MYSQL_USER: polymarket
+      MYSQL_PASSWORD: polymarket123
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: >
+      --innodb-buffer-pool-size=128M
+      --innodb-log-buffer-size=16M
+      --key_buffer_size=16M
+      --tmp_table_size=32M
+      --max_heap_table_size=32M
+      --performance_schema=OFF
+    networks:
+      - polymarket-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: polymarket-anvil
+    ports:
+      - "8545:8545"
+    command: anvil --host 0.0.0.0 --port 8545 --chain-id 31337
+    networks:
+      - polymarket-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  redis_data:
+  mysql_data:
+
+networks:
+  polymarket-network:
+    driver: bridge
