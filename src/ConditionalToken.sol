@@ -38,7 +38,8 @@ contract ConditionalToken is ERC1155, EIP712, ReentrancyGuard, Ownable {
     IERC20 public immutable COLLATERAL_TOKEN;
     uint256 public marketCounter;
     mapping(uint256 => Market) public markets;
-    mapping(address => mapping(uint256 => bool)) public usedNonces;
+    // mapping(address => mapping(uint256 => bool)) public usedNonces;
+    mapping(bytes32 => uint256) public orderFilledAmount;
     mapping(address => bool) public authorizedRelayers;
 
     bytes32 private constant ORDER_TYPEHASH = keccak256(
@@ -81,30 +82,56 @@ contract ConditionalToken is ERC1155, EIP712, ReentrancyGuard, Ownable {
         bytes calldata makerSig,
         bytes calldata takerSig
     ) external nonReentrant returns (bool success) {
-        require(makerOrder.amount > 0, "Invalid maker amount");
-        require(takerOrder.amount > 0, "Invalid taker amount");
+        // 1. 官方 Relayer 门禁，防抢跑
+        require(authorizedRelayers[msg.sender], "Not authorized relayer");
+        
+        // 2. 基础校验
         require(makerOrder.marketId == takerOrder.marketId, "Market mismatch");
         require(makerOrder.isYes != takerOrder.isYes, "Side must be opposite");
         require(makerOrder.maker != takerOrder.maker, "Self-trading not allowed");
         require(makerOrder.marketId < marketCounter, "Market does not exist");
         require(!markets[makerOrder.marketId].resolved, "Market resolved");
-        require(!usedNonces[makerOrder.maker][makerOrder.nonce], "Maker nonce used");
-        require(!usedNonces[takerOrder.maker][takerOrder.nonce], "Taker nonce used");
-        require(_verifySignature(makerOrder.maker, _hashOrder(makerOrder), makerSig), "Invalid maker signature");
-        require(_verifySignature(takerOrder.maker, _hashOrder(takerOrder), takerSig), "Invalid taker signature");
         require(makerOrder.price + takerOrder.price == 10000, "Price must sum to 1 USDC");
 
-        usedNonces[makerOrder.maker][makerOrder.nonce] = true;
-        usedNonces[takerOrder.maker][takerOrder.nonce] = true;
+        // 3. 签名校验
+        bytes32 makerHash = _hashOrder(makerOrder);
+        bytes32 takerHash = _hashOrder(takerOrder);
+        require(_verifySignature(makerOrder.maker, makerHash, makerSig), "Invalid maker signature");
+        require(_verifySignature(takerOrder.maker, takerHash, takerSig), "Invalid taker signature");
 
-        uint256 fillAmount = makerOrder.amount < takerOrder.amount ? makerOrder.amount : takerOrder.amount;
-        uint256 tokenId = makerOrder.isYes ? _getYesTokenId(makerOrder.marketId) : _getNoTokenId(makerOrder.marketId);
-        address buyer = makerOrder.isYes ? makerOrder.maker : takerOrder.maker;
-        address seller = makerOrder.isYes ? takerOrder.maker : makerOrder.maker;
-        uint256 usdcAmount = (makerOrder.price * fillAmount) / 10000;
+        // 4. 计算剩余可成交量（支持 Partial Fill）
+        uint256 makerRemaining = makerOrder.amount - orderFilledAmount[makerHash];
+        uint256 takerRemaining = takerOrder.amount - orderFilledAmount[takerHash];
+        require(makerRemaining > 0, "Maker order already filled");
+        require(takerRemaining > 0, "Taker order already filled");
 
-        COLLATERAL_TOKEN.safeTransferFrom(buyer, seller, usdcAmount);
-        _safeTransferFrom(seller, buyer, tokenId, fillAmount, "");
+        // 5. 取两者的最小值为本次实际成交量
+        uint256 fillAmount = makerRemaining < takerRemaining ? makerRemaining : takerRemaining;
+        
+        // 6. 更新已成交量账本
+        orderFilledAmount[makerHash] += fillAmount;
+        orderFilledAmount[takerHash] += fillAmount;
+
+        // 7. 计算双方需要支付的 USDC（避免精度归零风险）
+        uint256 makerUsdc = (makerOrder.price * fillAmount) / 10000;
+        uint256 takerUsdc = (takerOrder.price * fillAmount) / 10000;
+        require(makerUsdc > 0 && takerUsdc > 0, "Amount too small, rounding to zero");
+
+        // 8. 资金转移：从双方钱包拉取 USDC 到合约
+        COLLATERAL_TOKEN.safeTransferFrom(makerOrder.maker, address(this), makerUsdc);
+        COLLATERAL_TOKEN.safeTransferFrom(takerOrder.maker, address(this), takerUsdc);
+
+        // 9. 份额分发：直接铸造给双方
+        uint256 yesTokenId = _getYesTokenId(makerOrder.marketId);
+        uint256 noTokenId = _getNoTokenId(makerOrder.marketId);
+
+        if (makerOrder.isYes) {
+            _mint(makerOrder.maker, yesTokenId, fillAmount, "");
+            _mint(takerOrder.maker, noTokenId, fillAmount, "");
+        } else {
+            _mint(makerOrder.maker, noTokenId, fillAmount, "");
+            _mint(takerOrder.maker, yesTokenId, fillAmount, "");
+        }
 
         emit OrderFilled(makerOrder.marketId, makerOrder.maker, takerOrder.maker, fillAmount, makerOrder.price, takerOrder.price, makerOrder.isYes, msg.sender);
         return true;
@@ -147,7 +174,6 @@ contract ConditionalToken is ERC1155, EIP712, ReentrancyGuard, Ownable {
             tokenId = _getNoTokenId(marketId);
             redeemAmount = amount;
         } else if (result == MarketState.Invalid) {
-            require(amount % 2 == 0, "Amount must be even for Invalid market");
             if (balanceOf(msg.sender, _getYesTokenId(marketId)) >= amount) {
                 tokenId = _getYesTokenId(marketId);
                 redeemAmount = amount / 2;
